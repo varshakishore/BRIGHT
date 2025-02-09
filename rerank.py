@@ -8,6 +8,8 @@ import argparse
 from datasets import load_dataset
 import torch
 from sentence_transformers import CrossEncoder
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModelForCausalLM
+
 
 from retrievers import calculate_retrieval_metrics
 import functools
@@ -182,6 +184,100 @@ class OpenAIModel:
             # return output.choices[0].message.content
         return None
 
+class JudgeRank:
+    def __init__(self):
+        model_id = "meta-llama/Llama-3.1-70B-Instruct"
+        self.model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        # set random seed
+        torch.manual_seed(42)
+
+    def rerank(self, docs, query, topk):
+        scores = []
+        query_prompt = (f'You will be presented with a query.\n\n'
+                        f'Your task consists of the following step:\n\n'
+                        f'1. Analyze the query:\n'
+                        f'- Carefully read each sentence of the query.\n'
+                        f'- Identify the core problem or question being asked.\n\n'
+                        f'Here is the query:\n'
+                        f'{query}\n\n'
+                        )
+        inputs = self.tokenizer(query_prompt, return_tensors="pt").to("cuda")  # Move to GPU
+        print(inputs["input_ids"].shape)
+
+        with torch.no_grad():
+            outputs = self.model.generate(**inputs, max_new_tokens=512)
+
+        # Decode only the new tokens
+        query_prompt_output = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+
+        i = 0
+        for doc in docs:
+            if i == 10: break
+            doc_prompt = (f'You will be presented with a query, an analysis of the query, and a passage.\n\n'
+                            f'Your task consists of the following steps:\n\n'
+                            f'1. Analyze the passage:\n'
+                            f'- Thoroughly examine each sentence of the passage.\n'
+                            f'- List all sentences from the passage that are relevant the query.\n'
+                            f'- Briefly explain how each sentence listed is related the query.\n\n'
+                            f'2. Assess overall relevance:\n'
+                            f'- If the passage, particularly the relevant sentences (if applicable), are related to the query, briefly explain why.\n'
+                            f'- Otherwise, briefly explain why not.\n\n'
+                            f'Here is the query:\n'
+                            f'{query}\n\n'
+                            f'Here is the analysis of the query:\n'
+                            f'{query_prompt_output}\n\n'
+                            f'Here is the passage:\n'
+                            f'{doc["text"]}\n\n'
+                            )
+
+            inputs = self.tokenizer(doc_prompt, return_tensors="pt").to("cuda")  # Move to GPU
+
+            with torch.no_grad():
+                outputs = self.model.generate(**inputs, max_new_tokens=1024)
+            
+            # Decode only the new tokens
+            doc_prompt_output = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+
+            judgement_prompt = (f'You will be presented with a query, an analysis of the query, a passage, and an analysis of the passage.\n\n'
+                            f'Your task is to assess if the passage is relevant to the query in one word:\n'
+                            f'- Yes: If the passage is relevant to the query.\n'
+                            f'- No: Otherwise.\n\n'
+                            f'Important: Respond using exactly one of the following two words without quotation marks: Yes or No.\n\n'
+                            f'Here is the query:\n'
+                            f'{query}\n\n'
+                            f'Here is the analysis of the query:\n'
+                            f'{query_prompt_output}\n\n'
+                            f'Here is the passage:\n'
+                            f'{doc["text"]}\n\n'
+                            f'Here is the analysis of the passage:\n'
+                            f'{doc_prompt_output}\n\n'
+                            f'The final answer is: '
+                            )
+
+            inputs = self.tokenizer(judgement_prompt, return_tensors="pt").to("cuda")  # Move to GPU
+
+            with torch.no_grad():
+                outputs = self.model.generate(**inputs, max_new_tokens=32, return_dict_in_generate=True, output_logits=True)
+            
+            # Decode only the new tokens
+            judgement_prompt_output = self.tokenizer.decode(outputs[0][0, inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+            print(judgement_prompt_output)
+            logits = outputs.logits[0].squeeze()
+            desired_token_id_1 = self.tokenizer.encode(" Yes", add_special_tokens=False)[0]
+            desired_token_id_2 = self.tokenizer.encode(" No", add_special_tokens=False)[0]
+            top10 = torch.topk(logits, 10)[1]
+            # sanity check to make sure the model is predicting yes/no in the expected format
+            if desired_token_id_1 not in top10 and desired_token_id_2 not in top10:
+                import pdb; pdb.set_trace()
+            score = logits[desired_token_id_1]/(logits[desired_token_id_1] + logits[desired_token_id_2])
+            scores.append(score.item())
+            print(score)
+        
+        ranking = {doc["id"]: score for doc, score in zip(docs, scores)}
+        ranking = dict(sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:topk])
+        return ranking
+
 
 class STReranker:
     def __init__(self, model_name, batch_size=8):
@@ -193,6 +289,24 @@ class STReranker:
         inputs = [(query, doc["text"]) for doc in docs]
         scores = self.model.predict(inputs, batch_size=self.batch_size)
         ranking = {doc["id"]: score.item() for doc, score in zip(docs, scores)}
+        ranking = dict(sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:topk])
+        return ranking
+
+class BGEReranker:
+    def __init__(self, model_name, batch_size=8):
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.batch_size = batch_size
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+    @torch.no_grad()
+    def rerank(self, docs, query, topk):
+        pairs = [[query, doc["text"]] for doc in docs]
+        inputs = self.tokenizer(pairs, padding=True, truncation=True, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        scores = self.model(**inputs, return_dict=True).logits.view(-1, ).float().tolist()
+        ranking = {doc["id"]: score for doc, score in zip(docs, scores)}
         ranking = dict(sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:topk])
         return ranking
 
@@ -208,20 +322,27 @@ if __name__=='__main__':
     parser.add_argument('--rerank_score_file', type=str, default=None)
     parser.add_argument('--input_k', type=int)
     parser.add_argument('--k', type=int)
+    parser.add_argument('--cache_dir', type=str, default='cache')
+    parser.add_argument('--reasoning', type=str, default=None)
     args = parser.parse_args()
 
     if os.path.exists(args.rerank_score_file):
         print(f"Rerank score file {args.rerank_score_file} already exists.")
         exit()
 
-    raw_examples = load_dataset('xlangai/bright', 'examples')[args.task]
+    if args.reasoning is not None:
+        raw_examples = load_dataset('xlangai/bright', f"{args.reasoning}_reason", cache_dir=args.cache_dir)[args.task]
+    else:
+        raw_examples = load_dataset('xlangai/bright', 'examples',cache_dir=args.cache_dir)[args.task]
+
+    # raw_examples = load_dataset('xlangai/bright', 'examples', cache_dir=args.cache_dir)[args.task]
     examples = {}
     for e in raw_examples:
         examples[e['id']] = e
     if args.long_context:
-        doc_pairs = load_dataset('xlangai/bright', 'long_documents')[args.task]
+        doc_pairs = load_dataset('xlangai/bright', 'long_documents', cache_dir=args.cache_dir)[args.task]
     else:
-        doc_pairs = load_dataset('xlangai/bright', 'documents')[args.task]
+        doc_pairs = load_dataset('xlangai/bright', 'documents', cache_dir=args.cache_dir)[args.task]
     documents = {}
     for d in doc_pairs:
         documents[d['id']] = d['content']
@@ -233,6 +354,10 @@ if __name__=='__main__':
         model = ClaudeModel(version=args.llm)
     elif "gpt" in args.llm:
         model = OpenAIModel(model_name=args.llm)
+    elif "bge" in args.llm:
+        model = BGEReranker(model_name=args.llm)
+    elif "judge" in args.llm:
+        model = JudgeRank()
     else:
         model = STReranker(model_name=args.llm)
 

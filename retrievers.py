@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from gritlm import GritLM
 from openai import OpenAI
 from transformers import AutoTokenizer, AutoModel
-from InstructorEmbedding import INSTRUCTOR
+# from InstructorEmbedding import INSTRUCTOR
 
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
