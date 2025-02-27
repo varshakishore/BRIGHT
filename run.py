@@ -28,7 +28,8 @@ if __name__=='__main__':
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--ignore_cache', action='store_true')
     args = parser.parse_args()
-    args.output_dir = os.path.join(args.output_dir,f"{args.task}_{args.model}_long_{args.long_context}_reasoning_{args.reasoning}")
+    # args.output_dir = os.path.join(args.output_dir,f"{args.task}_{args.model}_long_{args.long_context}_reasoning_{args.reasoning}")
+    args.output_dir = os.path.join(args.output_dir,f"{args.task}_{args.model}_reasoning_{args.reasoning}")
     if not os.path.isdir(args.output_dir):
         os.makedirs(args.output_dir)
     score_file_path = os.path.join(args.output_dir,f'score.json')

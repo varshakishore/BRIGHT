@@ -1,1 +1,9 @@
 .idea/
+
+jdk-23_linux-x64_bin.deb
+
+__pycache__/
+cache/
+outputs/
+outputs_5x/
+rerank_outputs/

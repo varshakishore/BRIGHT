@@ -11,6 +11,7 @@ from datasets import load_dataset
 import torch
 from sentence_transformers import CrossEncoder
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModelForCausalLM
+from openai import OpenAI
 
 
 # from retrievers import calculate_retrieval_metrics
@@ -20,8 +21,6 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s
                     datefmt='%m/%d/%Y %H:%M:%S')
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-
 
 def extract_program(a_string,lan='python',first_block_only=False):
     indices_object = re.finditer(pattern="```", string=a_string)
@@ -188,10 +187,11 @@ class OpenAIModel:
 
 class JudgeRank:
     def __init__(self):
-        model_name = "meta-llama/Llama-3.1-70B-Instruct"
-        self.sampling_params = SamplingParams(temperature=0.6, top_p=0.9, max_tokens=512)
+        # model_name = "meta-llama/Llama-3.1-70B-Instruct"
+        model_name = "hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4"
+        self.sampling_params = SamplingParams(temperature=0.6, top_p=0.9, max_tokens=2048)
         self.sampling_params_final = SamplingParams(temperature=0.6, top_p=0.9, max_tokens=32, logprobs=10)
-        self.model = LLM(model=model_name, dtype="bfloat16", tensor_parallel_size=torch.cuda.device_count(), max_model_len=8192)
+        self.model = LLM(model=model_name, dtype="bfloat16", tensor_parallel_size=torch.cuda.device_count(), max_model_len=16384)
 
         self.yes_token = self.model.get_tokenizer().encode(" Yes", add_special_tokens=False)[0]
         self.no_token = self.model.get_tokenizer().encode(" No", add_special_tokens=False)[0]
@@ -211,20 +211,12 @@ class JudgeRank:
 
         output = self.model.generate([query_prompt], self.sampling_params)
         query_prompt_output = output[0].outputs[0].text
-        print(query_prompt_output)
 
-        i = 0
-        start = time.time()
-        batch_size=8
-        for doc in docs:
-        # for list_docs in [docs[i:i+batch_size] for i in range(0, len(docs), batch_size)]:
-            i += 1
-            if i == 9: 
-                print("Time taken for 8 docs: ", time.time()-start)
-                import pdb; pdb.set_trace()
-                # terminate the program and not just the loop
-                import sys
-                sys.exit()
+        batch_size = 35
+        all_prompts = []
+        # for doc in docs:
+        for i in range(0, len(docs), batch_size):
+            list_docs = docs[i:i+batch_size]
             doc_prompt = (f'You will be presented with a query, an analysis of the query, and a passage.\n\n'
                             f'Your task consists of the following steps:\n\n'
                             f'1. Analyze the passage:\n'
@@ -239,11 +231,11 @@ class JudgeRank:
                             f'Here is the analysis of the query:\n'
                             f'{query_prompt_output}\n\n'
                             f'Here is the passage:\n'
-                            f'{doc["text"]}\n\n'
                             )
+            doc_prompts = [doc_prompt+'{}\n\n'.format(doc["text"]) for doc in list_docs]
             
-            output = self.model.generate([doc_prompt], self.sampling_params)
-            doc_prompt_output = output[0].outputs[0].text
+            output = self.model.generate(doc_prompts, self.sampling_params)
+            doc_prompt_outputs = [o.outputs[0].text for o in output]
             # print(doc_prompt_output)
 
             judgement_prompt = (f'You will be presented with a query, an analysis of the query, a passage, and an analysis of the passage.\n\n'
@@ -256,31 +248,302 @@ class JudgeRank:
                             f'Here is the analysis of the query:\n'
                             f'{query_prompt_output}\n\n'
                             f'Here is the passage:\n'
-                            f'{doc["text"]}\n\n'
-                            f'Here is the analysis of the passage:\n'
-                            f'{doc_prompt_output}\n\n'
-                            f'The final answer is: '
                             )
+            judgement_prompt1 = ('{}\n\n'
+                            f'Here is the analysis of the passage:\n'
+                            )
+            judgement_prompt2 = ('{}\n\n'
+                            'The final answer is: '
+                            )
+            judgement_prompts = [judgement_prompt+judgement_prompt1.format(doc["text"])+judgement_prompt2.format(doc_prompt_output) for doc, doc_prompt_output in zip(list_docs, doc_prompt_outputs)]
+            all_prompts.extend(judgement_prompts)
+            judgement_prompt_output = self.model.generate(judgement_prompts, self.sampling_params_final)
 
-            judgement_prompt_output = self.model.generate([judgement_prompt], self.sampling_params_final)
-            logprobs = judgement_prompt_output[0].outputs[0].logprobs[0]
-            if self.yes_token not in logprobs or self.no_token not in logprobs:
-                if self.yes_token not in logprobs and logprobs[self.no_token].logprob == 0.0:
-                    prob_yes = 0.0
-                elif self.no_token not in logprobs and logprobs[self.yes_token].logprob == 0.0:
-                    prob_no = 0.0
+            for j in judgement_prompt_output:
+                logprobs = j.outputs[0].logprobs[0]
+                if self.yes_token not in logprobs or self.no_token not in logprobs:
+                    if self.yes_token not in logprobs and self.no_token not in logprobs:
+                        scores.append(float('-inf'))
+                        continue
+                    elif self.yes_token not in logprobs and (float("-inf") in [item.logprob for item in logprobs.values()]):
+                        prob_yes = 0.0
+                        prob_no = math.exp(logprobs[self.no_token].logprob)
+                    elif self.no_token not in logprobs and (float("-inf") in [item.logprob for item in logprobs.values()]):
+                        prob_no = 0.0
+                        prob_yes = math.exp(logprobs[self.yes_token].logprob)
+                    else:
+                        import pdb; pdb.set_trace()
                 else:
-                    import pdb; pdb.set_trace()
-            else:
-                prob_yes = math.exp(logprobs[self.yes_token].logprob)
-                prob_no = math.exp(logprobs[self.no_token].logprob)
+                    prob_yes = math.exp(logprobs[self.yes_token].logprob)
+                    prob_no = math.exp(logprobs[self.no_token].logprob)
 
-            score = prob_yes / (prob_yes + prob_no)
-            scores.append(score)
-            print(score)
+                score = prob_yes / (prob_yes + prob_no)
+                scores.append(score)
+
         
         ranking = {doc["id"]: score for doc, score in zip(docs, scores)}
         ranking = dict(sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:topk])
+        write_dict = {"query": query, "judgement_prompts": all_prompts, "scores": scores, "ranking": ranking}
+        # write dict to json file
+        with open("judge_rank_r_results.jsonl", "a") as f:
+            f.write(json.dumps(write_dict) + "\n")
+        return ranking
+    
+class llama:
+    def __init__(self):
+        model_name = "meta-llama/Llama-3.1-70B-Instruct"
+        self.sampling_params = SamplingParams(temperature=0.6, top_p=0.9, max_tokens=32, logprobs=10)
+        self.model = LLM(model=model_name, dtype="bfloat16", tensor_parallel_size=torch.cuda.device_count(), max_model_len=16384)
+
+        self.yes_token = self.model.get_tokenizer().encode(" Yes", add_special_tokens=False)[0]
+        self.no_token = self.model.get_tokenizer().encode(" No", add_special_tokens=False)[0]
+        # set random seed
+        torch.manual_seed(42)
+
+    def rerank(self, docs, query, topk, iterx):
+        scores = []
+
+        batch_size = 50
+        all_outs = []
+        # for doc in docs:
+        for i in range(0, len(docs), batch_size):
+            list_docs = docs[i:i+batch_size]
+            # doc_prompt = ("A document is relevant if it contains information that helps answer or address the query.\n"
+            #               "A document is not relevant if it doesn't contain information that helps answer the query, even if it mentions similar topics.\n\n"
+            #               "Is the document below relevant to answering the query below?\n"
+            #               "The answer should be either 'Relevance judgement: Yes.' or 'Relevance judgement: No.' Don't output anything else. \n\n" 
+            #                 "Here is the query:\n"
+            #                 "<start_query>\n"
+            #                 f"{query}\n"
+            #                 "<end_query>\n\n"
+            #                 "Here is the document:\n"
+            #                 "<start_document>\n"
+            #                 )
+            doc_prompt = ("A document is relevant if it contains information that helps answer or address the query.\n"
+              "A document is not relevant if it doesn't contain information that helps answer the query, even if it mentions similar topics.\n\n"
+              "Is the document below relevant to answering the query below?\n"
+              "The answer should be 'Relevance score: X.' where X is a number from 0-5.\n"
+              "0 means completely irrelevant, 5 means highly relevant and completely addresses the query.\n"
+              "Don't output anything else.\n\n"
+              "Here is the query:\n"
+              "<start_query>\n"
+              f"{query}\n"
+              "<end_query>\n\n"
+              "Here is the document:\n"
+              "<start_document>\n"
+                )
+            doc_prompts = [doc_prompt+'{}\n<end_document>\n\n'.format(doc["text"]) for doc in list_docs]
+            
+            output = self.model.generate(doc_prompts, self.sampling_params)
+            doc_prompt_outputs = [o.outputs[0].text for o in output]
+            # print(doc_prompt_output)
+
+            
+            all_outs.extend(doc_prompt_outputs)
+
+            # for j in output:
+            #     if len(j.outputs[0].logprobs) < 3:
+            #         scores.append(float('-inf'))
+            #         continue
+            #     logprobs = j.outputs[0].logprobs[-3]
+            #     if self.yes_token not in logprobs or self.no_token not in logprobs:
+            #         if self.yes_token not in logprobs and self.no_token not in logprobs:
+            #             scores.append(float('-inf'))
+            #             continue
+            #         elif self.yes_token not in logprobs and (float("-inf") in [item.logprob for item in logprobs.values()]):
+            #             prob_yes = 0.0
+            #             prob_no = math.exp(logprobs[self.no_token].logprob)
+            #         elif self.no_token not in logprobs and (float("-inf") in [item.logprob for item in logprobs.values()]):
+            #             prob_no = 0.0
+            #             prob_yes = math.exp(logprobs[self.yes_token].logprob)
+            #         else:
+            #             scores.append(float('-inf'))
+            #     else:
+            #         prob_yes = math.exp(logprobs[self.yes_token].logprob)
+            #         prob_no = math.exp(logprobs[self.no_token].logprob)
+
+            #     score = prob_yes / (prob_yes + prob_no)
+            #     scores.append(score)
+            for i in range(len(doc_prompt_outputs)):
+                pos_score = doc_prompt_outputs[i].rfind("Relevance score:")
+                if pos_score != -1:
+                    score = float(doc_prompt_outputs[i][pos_score+16:pos_score+18])/5
+                    scores.append(score)
+                else:
+                    scores.append(-1)
+        
+        ranking = {doc["id"]: score for doc, score in zip(docs, scores)}
+        ranking = dict(sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:topk])
+        write_dict = {"query": query, "outputs": all_outs, "scores": scores, "ranking": ranking}
+        # write dict to json file
+        with open(f"llama_score_5x_{iterx}_rank_r_results.jsonl", "a") as f:
+            f.write(json.dumps(write_dict) + "\n")
+        return ranking
+    
+
+class R1:
+    def __init__(self):
+        model_name = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
+        self.sampling_params = SamplingParams(temperature=0.6, top_p=0.95, max_tokens=3072, logprobs=10)
+        self.model = LLM(model=model_name, dtype="bfloat16", tensor_parallel_size=torch.cuda.device_count(), max_model_len=24576)
+
+        self.yes_token = self.model.get_tokenizer().encode(" Yes", add_special_tokens=False)[0]
+        self.no_token = self.model.get_tokenizer().encode(" No", add_special_tokens=False)[0]
+        # set random seed
+        torch.manual_seed(42)
+
+    def rerank(self, docs, query, topk, iterx):
+        scores = []
+
+        batch_size = 50
+        all_outs = []
+        # for doc in docs:
+        for i in range(0, len(docs), batch_size):
+            list_docs = docs[i:i+batch_size]
+            # doc_prompt = ("Given a query and a document, tell me whether the document answers the query.\n"
+            #               "The answer should be either 'Relevance judgement: Yes.' or 'Relevance judgement: No.'\n\n" 
+            #                 "Here is the query:\n"
+            #                 "<start_query>\n"
+            #                 f"{query}\n"
+            #                 "<end_query>\n\n"
+            #                 "Here is the document:\n"
+            #                 "<start_document>\n"
+            #                 )
+            # doc_prompt = ("A document is relevant if it contains information that helps answer or address the query.\n"
+            #               "A document is not relevant if it doesn't contain information that helps answer the query, even if it mentions similar topics.\n\n"
+            #               "Is the document below relevant to answering the query below?\n"
+            #               "The answer should be either 'Relevance judgement: Yes.' or 'Relevance judgement: No.'\n\n" 
+            #                 "Here is the query:\n"
+            #                 "<start_query>\n"
+            #                 f"{query}\n"
+            #                 "<end_query>\n\n"
+            #                 "Here is the document:\n"
+            #                 "<start_document>\n"
+            #                 )
+            doc_prompt = ("A document is relevant if it contains information that helps answer or address the query.\n"
+              "A document is not relevant if it doesn't contain information that helps answer the query, even if it mentions similar topics.\n\n"
+              "Is the document below relevant to answering the query below?\n"
+              "The answer should be 'Relevance score: X.' where X is a number from 0-5.\n"
+              "0 means completely irrelevant, 5 means highly relevant and completely addresses the query.\n\n"
+              "Here is the query:\n"
+              "<start_query>\n"
+              f"{query}\n"
+              "<end_query>\n\n"
+              "Here is the document:\n"
+              "<start_document>\n"
+                )
+            doc_prompts = [doc_prompt+'{}\n<end_document>\n\n'.format(doc["text"]) for doc in list_docs]
+            
+            output = self.model.generate(doc_prompts, self.sampling_params)
+            doc_prompt_outputs = [o.outputs[0].text for o in output]
+            # import pdb; pdb.set_trace()
+            # print(doc_prompt_output)
+
+            
+            all_outs.extend(doc_prompt_outputs)
+
+            # for j in output:
+            #     if len(j.outputs[0].logprobs) < 3:
+            #         scores.append(float('-inf'))
+            #         continue
+            #     logprobs = j.outputs[0].logprobs[-3]
+            #     if self.yes_token not in logprobs or self.no_token not in logprobs:
+            #         if self.yes_token not in logprobs and self.no_token not in logprobs:
+            #             scores.append(float('-inf'))
+            #             continue
+            #         elif self.yes_token not in logprobs and (float("-inf") in [item.logprob for item in logprobs.values()]):
+            #             prob_yes = 0.0
+            #             prob_no = math.exp(logprobs[self.no_token].logprob)
+            #         elif self.no_token not in logprobs and (float("-inf") in [item.logprob for item in logprobs.values()]):
+            #             prob_no = 0.0
+            #             prob_yes = math.exp(logprobs[self.yes_token].logprob)
+            #         else:
+            #             scores.append(float('-inf'))
+            #     else:
+            #         prob_yes = math.exp(logprobs[self.yes_token].logprob)
+            #         prob_no = math.exp(logprobs[self.no_token].logprob)
+
+                # score = prob_yes / (prob_yes + prob_no)
+                # scores.append(score)
+            for i in range(len(doc_prompt_outputs)):
+                pos_score = doc_prompt_outputs[i].rfind("Relevance score:")
+                if pos_score != -1:
+                    try:
+                        score = float(doc_prompt_outputs[i][pos_score+16:pos_score+18])/5
+                        scores.append(score)
+                    except:
+                        print("In exception!!")
+                        scores.append(-2)
+                else:
+                    scores.append(-1)
+
+
+        
+        ranking = {doc["id"]: score for doc, score in zip(docs, scores)}
+        ranking = dict(sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:topk])
+        write_dict = {"query": query, "outputs": all_outs, "scores": scores, "ranking": ranking}
+        # write dict to json file
+        with open(f"r1_score_5x_{iterx}_rank_r_results.jsonl", "a") as f:
+            f.write(json.dumps(write_dict) + "\n")
+        return ranking
+
+class R1_api:
+    def __init__(self):
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key="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",
+            )
+
+    def rerank(self, docs, query, topk):
+        scores = []
+        import pdb; pdb.set_trace()
+
+        all_outs = []
+        # for doc in docs:
+        for i in range(len(docs)):
+            doc_prompt = ("Given a query and a document, tell me whether the document answers the query.\n"
+                          "The answer should be either 'Relevance judgement: Yes.' or 'Relevance judgement: No.'\n\n" 
+                            "Here is the query:\n"
+                            "<start_query>\n"
+                            f"{query}\n"
+                            "<end_query>\n\n"
+                            "Here is the document:\n"
+                            "<start_document>\n"
+                            )
+            doc_prompts = doc_prompt+'{}\n<end_document>\n\n'.format(docs[i]["text"])
+
+            completion = self.client.chat.completions.create(
+                extra_body={},
+                model="deepseek/deepseek-r1:free",
+                messages=[
+                    {
+                    "role": "user",
+                    "content": doc_prompts
+                    }
+                ]
+                )
+            import pdb; pdb.set_trace()
+            
+            doc_prompt_output = completion.choices[0].message.content
+            
+            all_outs.append(doc_prompt_output)
+
+            pos_yes = max(doc_prompt_output.rfind("Yes"), doc_prompt_output.rfind("yes"))
+            pos_no = max(doc_prompt_output.rfind("No"), doc_prompt_output.rfind("no"))
+            if pos_yes > pos_no:
+                scores.append(1.0)
+            elif pos_yes <= pos_no:
+                scores.append(0.0)
+            else:
+                scores.append(float('-inf'))
+
+        
+        ranking = {doc["id"]: score for doc, score in zip(docs, scores)}
+        ranking = dict(sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:topk])
+        write_dict = {"query": query, "outputs": all_outs, "scores": scores, "ranking": ranking}
+        # write dict to json file
+        with open("r1_rank_r_results.jsonl", "a") as f:
+            f.write(json.dumps(write_dict) + "\n")
         return ranking
 
 
@@ -363,10 +626,21 @@ if __name__=='__main__':
         model = BGEReranker(model_name=args.llm)
     elif "judge" in args.llm:
         model = JudgeRank()
+    elif "r1_api" in args.llm:
+        model = R1_api()
+    elif "r1" in args.llm:
+        model = R1()
+    elif "llama" in args.llm:
+        model = llama()
     else:
         model = STReranker(model_name=args.llm)
 
     for qid,scores in tqdm(all_scores.items()):
+        
+        # skip the first 17 examples
+        if int(qid) < 27:
+            continue
+        print(qid)
         docs = []
         sorted_scores = sorted(scores.items(),key=lambda x:x[1],reverse=True)[:args.input_k]
         for did, _ in sorted_scores:
@@ -385,8 +659,12 @@ if __name__=='__main__':
             new_scores[qid] = cur_score
         else:
             ctxs = [{'id': did, 'text': documents[did]} for did, _ in sorted_scores]
-            cur_score = model.rerank(query=examples[qid]['query'], docs=ctxs, topk=args.k)
+            for iterx in range(5):
+                cur_score = model.rerank(query=examples[qid]['query'], docs=ctxs, topk=args.k, iterx=iterx)
             new_scores[qid] = cur_score
+
+    import sys
+    sys.exit()
 
     os.makedirs(os.path.dirname(args.rerank_score_file), exist_ok=True)
     with open(args.rerank_score_file, 'w') as f:
